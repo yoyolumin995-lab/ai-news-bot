@@ -1,7 +1,7 @@
 """
 每日 AI 资讯 → 飞书推送（卡片版）
 
-抓取 RSS 源 → Claude 中文摘要 + 配图 → 飞书卡片消息。
+抓取 RSS 源 → DeepSeek 中文摘要 + 配图 → 飞书卡片消息。
 """
 
 import os
@@ -13,7 +13,6 @@ import json
 import time
 from datetime import datetime, timezone, timedelta
 from html import unescape
-from html.parser import HTMLParser
 
 import feedparser
 import requests
@@ -33,14 +32,11 @@ RSS_FEEDS = [
 # 每个源最多取几条
 MAX_PER_FEED = 4
 
-# AI 摘要时最多喂给 Claude 多少条（控制 token 消耗）
+# AI 摘要时最多喂多少条
 MAX_ITEMS_FOR_AI = 16
 
 # 每张飞书卡片最多展示几条新闻
 ITEMS_PER_CARD = 8
-
-# 单张飞书卡片最大字符数
-FEISHU_CARD_MAX_CHARS = 15000
 
 # 北京时间
 TZ_CN = timezone(timedelta(hours=8))
@@ -195,7 +191,7 @@ def build_news_card(items: list[dict], card_index: int, total_cards: int) -> dic
     # 底部备注
     elements.append({
         "tag": "note",
-        "elements": [{"tag": "plain_text", "content": "⚡ 每日 AI 资讯自动推送 | Powered by GitHub Actions + Claude"}],
+        "elements": [{"tag": "plain_text", "content": "⚡ 每日 AI 资讯自动推送 | Powered by GitHub Actions + DeepSeek"}],
     })
 
     card = {
@@ -274,17 +270,17 @@ def fetch_all_news() -> list[dict]:
     return all_items
 
 
-# ========================= AI 中文摘要 =========================
+# ========================= AI 中文摘要（DeepSeek） =========================
 
-def summarize_with_claude(items: list[dict], api_key: str) -> list[dict]:
+def summarize_with_deepseek(items: list[dict], api_key: str) -> list[dict]:
     """
-    使用 Claude 对新闻列表做中文改写 + 摘要。
-    返回带有 cn_summary 字段的 items 列表。
+    使用 DeepSeek 对新闻列表做中文标题 + 摘要。
+    返回带有 cn_title、cn_summary 字段的 items 列表。
+    DeepSeek API 兼容 OpenAI 格式，中文效果好、价格便宜。
     """
     if not items:
         return items
 
-    # 取前 N 条给 AI 处理
     items_to_process = items[:MAX_ITEMS_FOR_AI]
 
     # 构造 prompt
@@ -324,64 +320,53 @@ def summarize_with_claude(items: list[dict], api_key: str) -> list[dict]:
 {chr(10).join(headlines)}"""
 
     resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
+        "https://api.deepseek.com/v1/chat/completions",
         headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
         },
         json={
-            "model": "claude-sonnet-4-6",
+            "model": "deepseek-chat",
             "max_tokens": 2560,
+            "temperature": 0.7,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=90,
     )
 
     if resp.status_code != 200:
-        print(f"⚠️ Claude API 返回 {resp.status_code}：{resp.text[:300]}")
-        return items  # 返回不带 cn_summary 的原始列表
+        print(f"⚠️ DeepSeek API 返回 {resp.status_code}：{resp.text[:300]}")
+        return items
 
     data = resp.json()
-    content = data.get("content", [])
-    ai_text = ""
-    for block in content:
-        if block.get("type") == "text":
-            ai_text = block["text"].strip()
-            break
-
+    ai_text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     if not ai_text:
         return items
 
     # 解析 AI 输出，匹配每条新闻的中文标题和摘要
-    # 匹配模式：**【数字】中文标题**\n**原标题：English**\n中文摘要
     cn_map = {}
-    # 按 "**【数字】" 分割
     blocks = re.split(r"\n(?=\*\*【\d+】)", ai_text)
 
     for block_text in blocks:
-        # 提取：**【1】中文标题** \n **原标题：xxx** \n 中文内容
         m = re.match(
             r"\*\*【(\d+)】(.+?)\*\*\s*\n\*\*原标题：(.+?)\*\*\s*\n(.*)",
             block_text,
             re.DOTALL,
         )
         if m:
-            idx = int(m.group(1)) - 1  # 0-based
+            idx = int(m.group(1)) - 1
             cn_title = m.group(2).strip()
             cn_body = m.group(4).strip()
-            # 去掉 "📌 今日看点" 及之后
             cn_body = cn_body.split("📌")[0].strip()
             if cn_title:
                 cn_map[idx] = {"cn_title": cn_title, "cn_summary": cn_body}
 
-    # 回填 cn_title + cn_summary
+    # 回填
     for i, item in enumerate(items):
         if i in cn_map:
             item["cn_title"] = cn_map[i]["cn_title"]
             item["cn_summary"] = cn_map[i]["cn_summary"]
         else:
-            # 无 AI 摘要时用原文
             item["cn_title"] = item.get("title", "")[:100]
             item["cn_summary"] = item.get("summary", "")[:200]
 
@@ -447,7 +432,7 @@ def main():
         return
 
     feishu_secret = os.environ.get("FEISHU_SECRET", "").strip() or None
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip() or None
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "").strip() or None
 
     print("=" * 50)
     print(f"🕗 开始运行 · {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}")
@@ -472,13 +457,12 @@ def main():
         return
 
     # 2. AI 摘要
-    if anthropic_key:
-        print("🤖 正在使用 Claude 生成中文摘要...")
-        items = summarize_with_claude(items, anthropic_key)
+    if deepseek_key:
+        print("🤖 正在使用 DeepSeek 生成中文摘要...")
+        items = summarize_with_deepseek(items, deepseek_key)
 
     # 3. 生成卡片
-    if anthropic_key:
-        # 有 AI 摘要 → 直接构建卡片
+    if deepseek_key:
         chunks = [items[i:i + ITEMS_PER_CARD] for i in range(0, len(items), ITEMS_PER_CARD)]
         cards = [build_news_card(chunk, idx, len(chunks)) for idx, chunk in enumerate(chunks)]
     else:
