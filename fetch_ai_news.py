@@ -156,7 +156,7 @@ def build_news_card(items: list[dict], card_index: int, total_cards: int) -> dic
 
     elements = []
     for i, item in enumerate(items):
-        title = item["title"]
+        cn_title = item.get("cn_title", item["title"])
         link = item["link"]
         cn_summary = item.get("cn_summary", "")
         image_url = item.get("image")
@@ -168,20 +168,20 @@ def build_news_card(items: list[dict], card_index: int, total_cards: int) -> dic
 
         # 构建每条新闻的 lark_md
         md = ""
-        # 标题（粗体 + 链接）
-        md += f"**{title}**  \n"
+        # 中文标题（粗体）
+        md += f"**{cn_title}**  \n"
         # 来源 + 时间
         if time_str:
             md += f"📰 {source} · {time_str}  \n"
         else:
             md += f"📰 {source}  \n"
-        # 链接
+        # 原文链接
         if link:
             md += f"🔗 [阅读原文]({link})  \n"
         # 中文摘要
         if cn_summary:
             md += f"\n{cn_summary}  \n"
-        # 配图（lark_md 使用 ![](url) 语法）
+        # 配图
         if image_url:
             md += f"\n![配图]({image_url})  \n"
 
@@ -299,17 +299,21 @@ def summarize_with_claude(items: list[dict], api_key: str) -> list[dict]:
 
     prompt = f"""以下是今天抓取到的 AI 领域新闻。请你：
 
-1. **为每条新闻写一段中文摘要**（2-3 句），用自己的话总结核心信息，不是字面翻译
-2. **保留英文原文标题**作为引用
+1. **为每条新闻写一个中文标题**（简洁明了，保留原意的核心信息）
+2. **为每条新闻写一段中文摘要**（2-3 句），用自己的话总结核心信息，不是字面翻译
 3. 最后加一段「📌 今日看点」简要综述（2-3 句话概括今天最重要的趋势）
-4. 使用 Markdown 排版，整体简洁专业
+4. 整体简洁专业，用中文表达
 
 输出格式（严格按此模板）：
 
-**1. [英文原题]**
+**【1】中文标题**
+
+**原标题：English Original Title Here**
 中文摘要内容……
 
-**2. [英文原题]**
+**【2】中文标题**
+
+**原标题：English Original Title Here**
 中文摘要内容……
 
 📌 今日看点
@@ -349,29 +353,36 @@ def summarize_with_claude(items: list[dict], api_key: str) -> list[dict]:
     if not ai_text:
         return items
 
-    # 解析 AI 输出，匹配每条新闻的中文摘要
-    # 匹配模式：**数字. 标题** 后面跟的中文摘要
+    # 解析 AI 输出，匹配每条新闻的中文标题和摘要
+    # 匹配模式：**【数字】中文标题**\n**原标题：English**\n中文摘要
     cn_map = {}
-    # 按 "**N." 或 "**数字." 分割
-    blocks = re.split(r"\n(?=\*\*\d+\.)", ai_text)
+    # 按 "**【数字】" 分割
+    blocks = re.split(r"\n(?=\*\*【\d+】)", ai_text)
 
     for block_text in blocks:
-        # 提取序号
-        m = re.match(r"\*\*(\d+)\.\s*(.+?)\*\*\s*\n(.*)", block_text, re.DOTALL)
+        # 提取：**【1】中文标题** \n **原标题：xxx** \n 中文内容
+        m = re.match(
+            r"\*\*【(\d+)】(.+?)\*\*\s*\n\*\*原标题：(.+?)\*\*\s*\n(.*)",
+            block_text,
+            re.DOTALL,
+        )
         if m:
             idx = int(m.group(1)) - 1  # 0-based
-            cn_summary = m.group(3).strip()
-            # 把 "📌 今日看点" 及之后的内容去掉
-            look_line = cn_summary.split("📌")[0].strip()
-            if look_line:
-                cn_map[idx] = look_line
+            cn_title = m.group(2).strip()
+            cn_body = m.group(4).strip()
+            # 去掉 "📌 今日看点" 及之后
+            cn_body = cn_body.split("📌")[0].strip()
+            if cn_title:
+                cn_map[idx] = {"cn_title": cn_title, "cn_summary": cn_body}
 
-    # 回填 cn_summary
+    # 回填 cn_title + cn_summary
     for i, item in enumerate(items):
         if i in cn_map:
-            item["cn_summary"] = cn_map[i]
+            item["cn_title"] = cn_map[i]["cn_title"]
+            item["cn_summary"] = cn_map[i]["cn_summary"]
         else:
-            # 无 AI 摘要时用原文摘要（已清理 HTML）
+            # 无 AI 摘要时用原文
+            item["cn_title"] = item.get("title", "")[:100]
             item["cn_summary"] = item.get("summary", "")[:200]
 
     return items
